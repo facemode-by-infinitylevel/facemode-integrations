@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "livekit-plugins-facemode"
+version = "0.1.0"
+description = "FaceMode avatar integration for LiveKit Agents"
+requires-python = ">=3.13"
+dependencies = [
+    "aiohttp>=3.10,<4",
+    "livekit>=1.1,<2",
+    "livekit-agents>=1.7,<2",
+    "websockets>=14,<17",
+]
+
+[tool.setuptools.packages.find]
+include = ["livekit_plugins_facemode*"]

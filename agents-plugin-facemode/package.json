@@ -1,0 +1,33 @@
+{
+  "name": "@facemode/agents-plugin-facemode",
+  "version": "0.1.0",
+  "description": "FaceMode avatar integration for LiveKit Agents",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/models.test.js test/avatar.test.js",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "@livekit/agents": "1.6.2",
+    "@livekit/rtc-node": "0.13.33",
+    "ws": "8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.30",
+    "@types/ws": "8.18.1",
+    "typescript": "5.8.3"
+  }
+}
