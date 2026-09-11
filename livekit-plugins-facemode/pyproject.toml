@@ -5,6 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "livekit-plugins-facemode"
 version = "0.1.0"
+license = {text = "Apache-2.0"}
+classi
+fiers = [
+    "License :: OSI Approved :: Apache Software License"
+]
+
 description = "FaceMode avatar integration for LiveKit Agents"
 requires-python = ">=3.13"
 dependencies = [

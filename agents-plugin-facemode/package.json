@@ -7,11 +7,11 @@
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
+      "types": "./dist/index.d.ts", 
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": ["dist", "LICENSE"],
   "engines": {
     "node": ">=20"
   },
