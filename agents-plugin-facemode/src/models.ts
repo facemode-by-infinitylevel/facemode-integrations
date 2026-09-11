@@ -5,11 +5,21 @@ export interface LiveKitRoom {
   readonly name?: string;
 }
 
+export type SessionInputProvider =
+  | 'deepgram'
+  | 'gemini'
+  | 'gnani'
+  | 'elevenlabs'
+  | 'openai'
+  | 'cartesia'
+  | 'sarvam'
+  | 'custom';
+
 export interface SessionRequest {
   readonly avatarId: string;
   readonly room: LiveKitRoom;
   readonly livekit_room_id: string;
-  readonly waitForIngestion: boolean;
+  readonly inputProvider?: SessionInputProvider;
 }
 
 export interface IngestionDetails {
@@ -31,7 +41,7 @@ export interface SessionDetails {
 
 export function parseSessionDetails(
   payload: Record<string, unknown>,
-  fallback?: Pick<SessionDetails, 'room' | 'roomName'>,
+  fallback?: Pick<SessionDetails, 'room' | 'roomName' | 'sessionId'>,
 ): SessionDetails {
   const root = isRecord(payload.data) ? payload.data : payload;
   const session = isRecord(root.session) ? root.session : {};
@@ -40,7 +50,7 @@ export function parseSessionDetails(
     : isRecord(session.ingestion)
       ? session.ingestion
       : {};
-  const sessionId = firstText(session.id, session.sessionId, root.sessionId, root.id, root.jobId);
+  const sessionId = firstText(session.id, session.sessionId, root.sessionId, root.id, root.jobId, fallback?.sessionId);
   if (!sessionId) {
     throw new Error('FaceMode session response is missing a session ID');
   }

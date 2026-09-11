@@ -60,15 +60,31 @@ logger = logging.getLogger("pipecat_facemode")
 
 _MIN_INPUT_SAMPLE_RATE = 8_000
 _MAX_INPUT_SAMPLE_RATE = 48_000
-_INGESTION_READY_TIMEOUT_SECONDS = 60.0
+_INGESTION_READY_TIMEOUT_SECONDS = 240.0
 _INGESTION_INITIAL_RETRY_SECONDS = 0.25
 _INGESTION_MAX_RETRY_SECONDS = 2.0
 _END_ACK_TIMEOUT_SECONDS = 3.0
+_WS_OPEN_TIMEOUT_SECONDS = 240.0
+_WS_CLOSE_TIMEOUT = 2.0
+_RECONNECT_MAX_ATTEMPTS = 2
+_RECONNECT_INITIAL_BACKOFF_SECONDS = 0.5
+_RECONNECT_MAX_BACKOFF_SECONDS = 2.0
 _PREFERRED_SAMPLE_RATES = frozenset(
     {8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000}
 )
 _SUPPORTED_CHANNELS = frozenset({1, 2})
-_WS_CLOSE_TIMEOUT = 2.0
+_SUPPORTED_INPUT_PROVIDERS = frozenset(
+    {
+        "deepgram",
+        "gemini",
+        "gnani",
+        "elevenlabs",
+        "openai",
+        "cartesia",
+        "sarvam",
+        "custom",
+    }
+)
 
 
 class FaceModeVideoService(FrameProcessor):
@@ -98,6 +114,7 @@ class FaceModeVideoService(FrameProcessor):
         room_name: str | None = None,
         livekit_subscriber_token: str | None = None,
         avatar_participant_identity: str | None = None,
+        input_provider: str | None = None,
         forward_tts_audio: bool = False,
         utterance_idle_timeout: float = 0.35,
         protocol_timeout: float = 15.0,
@@ -118,6 +135,10 @@ class FaceModeVideoService(FrameProcessor):
             livekit_subscriber_token: Optional token for this process to subscribe.
             avatar_participant_identity: Optional identity filter for avatar tracks;
                 defaults to ``facemode-avatar`` when omitted.
+            input_provider: Optional speech input provider for the session. One of
+                ``deepgram``, ``gemini``, ``gnani``, ``elevenlabs``, ``openai``,
+                ``cartesia``, ``sarvam``, or ``custom``. The backend persists the
+                value for the session lifetime; reconnects reuse it.
             forward_tts_audio: Also pass source TTS frames downstream when true.
             utterance_idle_timeout: Seconds of silence after which an utterance ends.
             protocol_timeout: WebSocket start acknowledgement timeout.
@@ -142,6 +163,17 @@ class FaceModeVideoService(FrameProcessor):
             raise FaceModeConfigurationError("protocol_timeout must be positive")
         if api_timeout <= 0:
             raise FaceModeConfigurationError("api_timeout must be positive")
+        if input_provider is not None:
+            if not isinstance(input_provider, str) or not input_provider.strip():
+                raise FaceModeConfigurationError(
+                    "input_provider must be a non-empty string"
+                )
+            input_provider = input_provider.strip().lower()
+            if input_provider not in _SUPPORTED_INPUT_PROVIDERS:
+                raise FaceModeConfigurationError(
+                    "input_provider must be one of "
+                    f"{sorted(_SUPPORTED_INPUT_PROVIDERS)}"
+                )
 
         self.api_key = api_key
         self.avatar_id = avatar_id
@@ -150,6 +182,7 @@ class FaceModeVideoService(FrameProcessor):
         self.livekit_subscriber_token = livekit_subscriber_token or room_config.token
         self.room_name = room_name
         self.avatar_participant_identity = avatar_participant_identity
+        self.input_provider = input_provider
         self.forward_tts_audio = forward_tts_audio
         self.utterance_idle_timeout = utterance_idle_timeout
         self.protocol_timeout = protocol_timeout
@@ -162,9 +195,12 @@ class FaceModeVideoService(FrameProcessor):
 
         self._lifecycle_lock = asyncio.Lock()
         self._send_lock = asyncio.Lock()
+        self._reconnect_lock = asyncio.Lock()
         self._protocol_started_event = asyncio.Event()
         self._session_ended_event = asyncio.Event()
         self._avatar_ready_event = asyncio.Event()
+        self._transport_ready_event = asyncio.Event()
+        self._transport_terminal = False
         self._protocol_started = False
         self._protocol_start_sent = False
         self._protocol_error: FaceModeProtocolError | None = None
@@ -300,9 +336,11 @@ class FaceModeVideoService(FrameProcessor):
             self._protocol_started = False
             self._protocol_start_sent = False
             self._protocol_error = None
+            self._transport_terminal = False
             self._protocol_started_event = asyncio.Event()
             self._session_ended_event = asyncio.Event()
             self._avatar_ready_event = asyncio.Event()
+            self._transport_ready_event = asyncio.Event()
             self._sequence = 0
             self._audio_sample_rate = _optional_int(
                 getattr(frame, "audio_out_sample_rate", None)
@@ -323,20 +361,13 @@ class FaceModeVideoService(FrameProcessor):
                 self.session = await self._create_session(current_room_name)
                 self.session = await self._wait_for_ingestion(self.session)
                 self._session_log_marker = _sanitize_session_marker(self.session.session_id)
-                await self._connect_websocket()
-                self._receiver_task = asyncio.create_task(
-                    self._receive_events(), name="facemode-ws-receiver"
-                )
-                self._keepalive_task = asyncio.create_task(
-                    self._keepalive_loop(), name="facemode-ws-keepalive"
-                )
-                await self._ensure_protocol_started(
-                    self._audio_sample_rate or 24_000, 1
-                )
+                await self._open_protocol_socket()
                 self._started = True
                 logger.info("FaceMode Pipecat session started session=%s", self._session_log_marker)
             except BaseException:
-                await self._shutdown(send_end_session=False)
+                # The lifecycle lock is already held here, so run the teardown
+                # body directly; re-entering _shutdown would deadlock on it.
+                await self._shutdown_locked(send_end_session=False)
                 raise
 
     async def _connect_livekit(self) -> None:
@@ -380,6 +411,7 @@ class FaceModeVideoService(FrameProcessor):
             avatar_id=self.avatar_id,
             room=self.room_config,
             room_name=room_name,
+            input_provider=self.input_provider,
         )
         payload = request.to_payload()
         headers = {
@@ -486,24 +518,282 @@ class FaceModeVideoService(FrameProcessor):
     async def _connect_websocket(self) -> None:
         if self.session is None:
             raise FaceModeProtocolError("FaceMode session has not been created")
-        subprotocols = [f"aivatar.{self.session.ingestion.ws_token}"]
+        ingestion = self.session.ingestion
+        if not ingestion.ready or not ingestion.url or not ingestion.ws_token:
+            raise FaceModeProtocolError(
+                "FaceMode ingestion assignment is not ready"
+            )
+        subprotocols = [f"facemode.{ingestion.ws_token}"]
         try:
             # pyproject.toml requires websockets>=14, where additional_headers is
             # the supported custom-handshake API. Do not retry without the headers:
             # they may contain the backend-issued strict worker affinity directive.
             self.websocket = await websockets.connect(
-                self.session.ingestion.url,
+                ingestion.url,
                 subprotocols=subprotocols,
-                additional_headers=dict(self.session.ingestion.headers),
+                additional_headers=dict(ingestion.headers),
                 max_size=2**20,
                 ping_interval=None,
                 compression=None,
-                open_timeout=60,
+                open_timeout=_WS_OPEN_TIMEOUT_SECONDS,
             )
         except Exception as error:
             raise FaceModeProtocolError(
-                f"Unable to connect to FaceMode WebSocket: {_safe_error(error, self.session.ingestion.ws_token)}"
+                f"Unable to connect to FaceMode WebSocket: {_safe_error(error, ingestion.ws_token)}"
             ) from error
+        self._transport_ready_event.set()
+
+    async def _open_protocol_socket(self) -> None:
+        """Open the canonical socket and run the start handshake on it."""
+        await self._connect_websocket()
+        if self._stopping:
+            websocket = self.websocket
+            self.websocket = None
+            if websocket is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        websocket.close(), timeout=_WS_CLOSE_TIMEOUT
+                    )
+            raise FaceModeProtocolError("FaceMode session is stopping")
+        self._receiver_task = asyncio.create_task(
+            self._receive_events(), name="facemode-ws-receiver"
+        )
+        self._keepalive_task = asyncio.create_task(
+            self._keepalive_loop(), name="facemode-ws-keepalive"
+        )
+        await self._ensure_protocol_started(
+            self._audio_sample_rate or 24_000, self._audio_channels or 1
+        )
+
+    def _reconnect_blocked(self) -> bool:
+        """Return whether transport recovery is currently disallowed."""
+        return (
+            self._stopping
+            or not self._started
+            or self.session is None
+            or self._transport_terminal
+            or self._session_ended_event.is_set()
+        )
+
+    async def _await_transport(self) -> None:
+        """Block a send while a dropped socket is being reconnected."""
+        if self.websocket is not None:
+            return
+        if self._reconnect_blocked():
+            if self._protocol_error is not None:
+                raise self._protocol_error
+            raise FaceModeProtocolError("FaceMode WebSocket is not connected")
+        try:
+            await asyncio.wait_for(
+                self._transport_ready_event.wait(), timeout=self.protocol_timeout
+            )
+        except asyncio.TimeoutError as error:
+            raise FaceModeProtocolError(
+                "Timed out waiting for FaceMode WebSocket reconnect"
+            ) from error
+        if self.websocket is not None:
+            return
+        if self._protocol_error is not None:
+            raise self._protocol_error
+        raise FaceModeProtocolError("FaceMode WebSocket is not connected")
+
+    async def _maybe_recover_transport(self, websocket: Any) -> bool:
+        """Single-flight reconnect after the canonical socket dropped.
+
+        Only runs when the session was fully started and the loss was not an
+        intentional close, a server-terminal state, or an ``ended`` frame. At
+        most ``_RECONNECT_MAX_ATTEMPTS`` reconnects are tried with backoff, and
+        each attempt fetches a fresh one-time WebSocket token. Returns True when
+        a new socket negotiated ``started`` and the session resumed.
+        """
+        if self.websocket is not None and self.websocket is not websocket:
+            return True  # a concurrent flight already reconnected
+        if self._reconnect_blocked():
+            return False
+        async with self._reconnect_lock:
+            if self.websocket is not None and self.websocket is not websocket:
+                return True
+            if self._reconnect_blocked():
+                return False
+            delay = _RECONNECT_INITIAL_BACKOFF_SECONDS
+            last_error: FaceModeError | None = None
+            for attempt in range(1, _RECONNECT_MAX_ATTEMPTS + 1):
+                try:
+                    await self._reconnect_once()
+                except asyncio.CancelledError:
+                    # A cancelled flight must not leave a half-open socket or
+                    # orphaned receiver/keepalive tasks behind.
+                    with contextlib.suppress(Exception):
+                        await self._drop_connection_attempt()
+                    raise
+                except Exception as error:
+                    await self._drop_connection_attempt()
+                    last_error = (
+                        error
+                        if isinstance(error, FaceModeError)
+                        else FaceModeProtocolError(
+                            "FaceMode reconnect attempt failed: "
+                            f"{_safe_error(error)}"
+                        )
+                    )
+                    logger.warning(
+                        "FaceMode reconnect attempt %s/%s failed session=%s: %s",
+                        attempt,
+                        _RECONNECT_MAX_ATTEMPTS,
+                        self._session_log_marker,
+                        _safe_error(last_error),
+                    )
+                    if self._reconnect_blocked():
+                        break
+                    if attempt < _RECONNECT_MAX_ATTEMPTS:
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 2.0, _RECONNECT_MAX_BACKOFF_SECONDS)
+                    continue
+                logger.info(
+                    "FaceMode WebSocket reconnected session=%s",
+                    self._session_log_marker,
+                )
+                return True
+            if not self._started or self.session is None:
+                return False  # the session was torn down while reconnecting
+            self._transport_terminal = True
+            detail = ""
+            if last_error is not None:
+                detail = ": " + _safe_error(
+                    last_error,
+                    self.session.ingestion.ws_token if self.session else None,
+                )
+            self._set_protocol_error(
+                FaceModeProtocolError(
+                    "FaceMode WebSocket reconnect failed after "
+                    f"{_RECONNECT_MAX_ATTEMPTS} attempts{detail}"
+                )
+            )
+            self._transport_ready_event.set()
+            return False
+
+    async def _reconnect_once(self) -> None:
+        """Run one reconnect attempt against a clean per-connection slate."""
+        await self._drop_connection_attempt()
+        session = self.session
+        if session is None:
+            raise FaceModeProtocolError("FaceMode session is not initialized")
+        if self._stopping or self._transport_terminal:
+            raise FaceModeProtocolError("FaceMode session stopped during reconnect")
+        refreshed = await self._request_session_reconnect(session)
+        if self._stopping or self._transport_terminal:
+            raise FaceModeProtocolError("FaceMode session stopped during reconnect")
+        if refreshed.session_id != session.session_id:
+            raise FaceModeProtocolError(
+                "FaceMode reconnect returned a different session"
+            )
+        if refreshed.worker_status in {"FAILED", "ENDED"}:
+            raise FaceModeAPIError(
+                "FaceMode worker entered "
+                f"{refreshed.worker_status.lower()} state during reconnect"
+            )
+        ingestion = refreshed.ingestion
+        if not ingestion.ready or not ingestion.url or not ingestion.ws_token:
+            raise FaceModeAPIError(
+                "FaceMode reconnect response is missing WebSocket credentials"
+            )
+        self.session = refreshed
+        self._session_ended_event.clear()
+        self._utterance_context_id = None
+        self._cancel_utterance_timer()
+        await self._open_protocol_socket()
+        if self._stopping or self._transport_terminal:
+            raise FaceModeProtocolError("FaceMode session stopped during reconnect")
+        if self._utterance_active:
+            # The fresh socket has no utterance state. Re-declare the open
+            # utterance so following audio stays inside it without replaying.
+            await self._send_control("start_utterance")
+            self._arm_utterance_end_timer()
+
+    async def _drop_connection_attempt(self) -> None:
+        """Cancel per-connection tasks and close the current socket."""
+        current = asyncio.current_task()
+        keepalive = self._keepalive_task
+        self._keepalive_task = None
+        receiver = self._receiver_task
+        if receiver is not current:
+            self._receiver_task = None
+        for task in (keepalive, receiver):
+            if task is not None and task is not current and not task.done():
+                task.cancel()
+        for task in (keepalive, receiver):
+            if task is not None and task is not current:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+        websocket = self.websocket
+        self.websocket = None
+        self._transport_ready_event.clear()
+        if websocket is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(websocket.close(), timeout=_WS_CLOSE_TIMEOUT)
+        self._protocol_started = False
+        self._protocol_start_sent = False
+        self._protocol_error = None
+        self._protocol_started_event.clear()
+
+    async def _request_session_reconnect(self, session: SessionDetails) -> SessionDetails:
+        """Ask the API for a fresh one-time WebSocket credential.
+
+        The reconnect body carries only the original room object plus the
+        persisted ``inputProvider`` when one was configured; the backend rejects
+        any other field and any attempt to change the provider.
+        """
+        payload: dict[str, Any] = {"room": self.room_config.to_payload()}
+        if self.input_provider:
+            payload["inputProvider"] = self.input_provider
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        async def post(client: aiohttp.ClientSession) -> SessionDetails:
+            try:
+                async with client.post(
+                    f"{self.api_url}/sessions/{session.session_id}/reconnect",
+                    json=payload,
+                    headers=headers,
+                ) as response:
+                    body = await response.text()
+                    if response.status >= 400:
+                        raise FaceModeAPIError(
+                            "FaceMode session reconnect failed "
+                            f"(HTTP {response.status})"
+                        )
+            except FaceModeAPIError:
+                raise
+            except Exception as error:
+                raise FaceModeAPIError(
+                    "FaceMode session reconnect request failed: "
+                    f"{_safe_error(error, self.api_key, self.room_config.token)}"
+                ) from error
+
+            try:
+                response_payload = json.loads(body)
+            except json.JSONDecodeError as error:
+                raise FaceModeAPIError(
+                    "FaceMode reconnect response was not JSON"
+                ) from error
+            if not isinstance(response_payload, Mapping):
+                raise FaceModeAPIError(
+                    "FaceMode reconnect response was not an object"
+                )
+            try:
+                return SessionDetails.from_api(response_payload, fallback=session)
+            except ValueError as error:
+                raise FaceModeAPIError(
+                    "FaceMode reconnect response is incomplete"
+                ) from error
+
+        timeout = aiohttp.ClientTimeout(total=self.api_timeout)
+        if self._http_session is not None:
+            return await post(self._http_session)
+        async with aiohttp.ClientSession(timeout=timeout) as client:
+            return await post(client)
 
     async def _send_tts_frame(self, frame: TTSAudioRawFrame) -> None:
         sample_rate = _optional_int(getattr(frame, "sample_rate", None))
@@ -546,6 +836,8 @@ class FaceModeVideoService(FrameProcessor):
             raise FaceModeProtocolError(
                 f"Unsupported TTS channel count for FaceMode: {channels}"
             )
+        if self.websocket is None:
+            await self._await_transport()
         if self.websocket is None or self.session is None:
             raise FaceModeProtocolError("FaceMode WebSocket is not connected")
 
@@ -603,6 +895,12 @@ class FaceModeVideoService(FrameProcessor):
     async def _send_binary(self, audio: bytes) -> None:
         if self._protocol_error is not None:
             raise self._protocol_error
+        await self._await_transport()
+        # Audio may only flow after the start handshake, so a frame that arrives
+        # while a reconnect renegotiates waits for the fresh ``started`` first.
+        await self._ensure_protocol_started(
+            self._audio_sample_rate or 24_000, self._audio_channels or 1
+        )
         async with self._send_lock:
             websocket = self.websocket
             if websocket is None:
@@ -618,6 +916,7 @@ class FaceModeVideoService(FrameProcessor):
         if assume_lock:
             await self._send_json_locked(message)
             return
+        await self._await_transport()
         async with self._send_lock:
             await self._send_json_locked(message)
 
@@ -681,10 +980,12 @@ class FaceModeVideoService(FrameProcessor):
                 elif message_type == "pong":
                     logger.debug("FaceMode keepalive acknowledged")
                 elif message_type == "session_ending":
+                    self._transport_terminal = True
                     raise FaceModeProtocolError(
                         f"FaceMode session is ending: {_safe_text(message.get('reason'), 'unknown')}"
                     )
                 elif message_type == "ended":
+                    self._transport_terminal = True
                     self._session_ended_event.set()
                     break
                 elif message_type == "error":
@@ -693,6 +994,8 @@ class FaceModeVideoService(FrameProcessor):
                     protocol_error = FaceModeProtocolError(f"{code}: {detail}")
                     self._set_protocol_error(protocol_error)
                     logger.error("FaceMode protocol error code=%s", code)
+                    if bool(message.get("fatal", False)):
+                        self._transport_terminal = True
                     if bool(message.get("fatal", False)) or not self._protocol_started:
                         break
                 else:
@@ -701,6 +1004,12 @@ class FaceModeVideoService(FrameProcessor):
             raise
         except Exception as error:
             if not self._stopping:
+                # Transport faults are recoverable after a successful start;
+                # protocol violations are authoritative and are not retried.
+                if not isinstance(error, FaceModeProtocolError) and (
+                    await self._maybe_recover_transport(websocket)
+                ):
+                    return
                 protocol_error = (
                     error
                     if isinstance(error, FaceModeProtocolError)
@@ -713,12 +1022,15 @@ class FaceModeVideoService(FrameProcessor):
                 logger.warning("%s", protocol_error)
         else:
             if not self._stopping:
-                self._set_protocol_error(
-                    FaceModeProtocolError(
-                        "FaceMode WebSocket closed unexpectedly"
-                        f"{_websocket_close_details(websocket)}"
+                if await self._maybe_recover_transport(websocket):
+                    return
+                if self._protocol_error is None:
+                    self._set_protocol_error(
+                        FaceModeProtocolError(
+                            "FaceMode WebSocket closed unexpectedly"
+                            f"{_websocket_close_details(websocket)}"
+                        )
                     )
-                )
 
     async def _keepalive_loop(self) -> None:
         try:
@@ -903,65 +1215,73 @@ class FaceModeVideoService(FrameProcessor):
 
     async def _shutdown(self, *, send_end_session: bool) -> None:
         async with self._lifecycle_lock:
-            if self._stopping and not self._started and self.websocket is None and self.room is None:
-                return
-            self._stopping = True
-            self._accept_tracks = False
-            self._cancel_utterance_timer()
+            await self._shutdown_locked(send_end_session=send_end_session)
 
-            websocket = self.websocket
-            if send_end_session and websocket is not None and self._protocol_started:
-                with contextlib.suppress(FaceModeError):
-                    if self._utterance_active:
-                        await self._send_control("end_utterance")
-                    await self._send_control("end_session")
-                    await asyncio.wait_for(
-                        self._session_ended_event.wait(),
-                        timeout=_END_ACK_TIMEOUT_SECONDS,
-                    )
-            self._utterance_active = False
-            self._utterance_context_id = None
+    async def _shutdown_locked(self, *, send_end_session: bool) -> None:
+        """Tear down session resources; caller must hold ``_lifecycle_lock``."""
+        if self._stopping and not self._started and self.websocket is None and self.room is None:
+            return
+        self._stopping = True
+        self._transport_terminal = True
+        self._transport_ready_event.set()
+        self._accept_tracks = False
+        self._cancel_utterance_timer()
 
-            current = asyncio.current_task()
-            tasks = [
-                self._keepalive_task,
-                self._receiver_task,
-                *self._track_tasks.values(),
-            ]
-            self._keepalive_task = None
-            self._receiver_task = None
-            self._track_tasks.clear()
-            self._track_kinds.clear()
-            for task in tasks:
-                if task is not None and task is not current and not task.done():
-                    task.cancel()
-            for task in tasks:
-                if task is not None and task is not current:
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        await task
+        websocket = self.websocket
+        if send_end_session and websocket is not None and self._protocol_started:
+            # wait_for raises builtin TimeoutError when the server never sends
+            # "ended"; it must not escape or the teardown below is skipped.
+            with contextlib.suppress(FaceModeError, asyncio.TimeoutError):
+                if self._utterance_active:
+                    await self._send_control("end_utterance")
+                await self._send_control("end_session")
+                await asyncio.wait_for(
+                    self._session_ended_event.wait(),
+                    timeout=_END_ACK_TIMEOUT_SECONDS,
+                )
+        self._utterance_active = False
+        self._utterance_context_id = None
 
-            for stream in list(self._track_streams.values()):
-                await _close_async_resource(stream)
-            self._track_streams.clear()
+        current = asyncio.current_task()
+        tasks = [
+            self._keepalive_task,
+            self._receiver_task,
+            *self._track_tasks.values(),
+        ]
+        self._keepalive_task = None
+        self._receiver_task = None
+        self._track_tasks.clear()
+        self._track_kinds.clear()
+        for task in tasks:
+            if task is not None and task is not current and not task.done():
+                task.cancel()
+        for task in tasks:
+            if task is not None and task is not current:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
 
-            self.websocket = None
-            if websocket is not None:
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(websocket.close(), timeout=_WS_CLOSE_TIMEOUT)
+        for stream in list(self._track_streams.values()):
+            await _close_async_resource(stream)
+        self._track_streams.clear()
 
-            room = self.room
-            self.room = None
-            await _disconnect_room(room)
+        self.websocket = None
+        if websocket is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(websocket.close(), timeout=_WS_CLOSE_TIMEOUT)
 
-            self.session = None
-            self._session_log_marker = None
-            self._protocol_started = False
-            self._protocol_start_sent = False
-            self._protocol_error = None
-            self._protocol_started_event.set()
-            self._avatar_ready_event.clear()
-            self._started = False
-            self._stopping = False
+        room = self.room
+        self.room = None
+        await _disconnect_room(room)
+
+        self.session = None
+        self._session_log_marker = None
+        self._protocol_started = False
+        self._protocol_start_sent = False
+        self._protocol_error = None
+        self._protocol_started_event.set()
+        self._avatar_ready_event.clear()
+        self._started = False
+        self._stopping = False
 
     def _set_protocol_error(self, error: FaceModeProtocolError) -> None:
         self._protocol_error = error
@@ -1123,11 +1443,16 @@ def _safe_error(error: BaseException, *secrets: str | None) -> str:
     for secret in secrets:
         if secret:
             text = text.replace(secret, "<redacted>")
-    for marker in ("Bearer ", "aivatar."):
-        while marker in text:
-            start = text.index(marker) + len(marker)
+    for marker in ("Bearer ", "aivatar.", "facemode."):
+        cursor = 0
+        while True:
+            found = text.find(marker, cursor)
+            if found < 0:
+                break
+            start = found + len(marker)
             end = text.find(" ", start)
             if end < 0:
                 end = len(text)
             text = f"{text[:start]}<redacted>{text[end:]}"
+            cursor = start + len("<redacted>")
     return text[:300] or error.__class__.__name__

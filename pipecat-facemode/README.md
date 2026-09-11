@@ -60,6 +60,9 @@ facemode = FaceModeVideoService(
     },
     livekit_subscriber_token=os.environ["LIVEKIT_SUBSCRIBER_TOKEN"],
     room_name=os.environ["LIVEKIT_ROOM_NAME"],
+    # Optional speech input provider persisted by the backend for the session:
+    # deepgram, gemini, gnani, elevenlabs, openai, cartesia, sarvam, or custom.
+    input_provider=os.environ.get("FACEMODE_INPUT_PROVIDER") or None,
 )
 
 pipeline = Pipeline([
@@ -82,12 +85,14 @@ On `StartFrame`, the service:
 
 1. Connects to the supplied LiveKit room with `livekit-rtc` and enables automatic
    track subscription.
-2. Calls `POST {api_url}/sessions` with the room object and `waitForIngestion: true`:
+2. Calls `POST {api_url}/sessions` with the room object (and `inputProvider`
+   when `input_provider` is configured). The request never sends
+   `waitForIngestion`; current backends reject it as an unknown field:
 
    ```json
    {
      "avatarId": "avatar-id",
-     "waitForIngestion": true,
+     "inputProvider": "deepgram",
      "room": {
        "type": "livekit",
        "url": "wss://project.livekit.cloud",
@@ -96,8 +101,11 @@ On `StartFrame`, the service:
    }
    ```
 
-3. When the response has `ingestion.ready: false`, polls `GET {api_url}/sessions/{id}` using bounded backoff until ready WebSocket credentials are available. Room credentials from the initial response remain in memory and are not expected in the status response.
-4. Opens the returned WebSocket with the `aivatar.<ws-token>` subprotocol, compression disabled, native keepalives disabled, and optional backend-provided `ingestion.headers` forwarded unchanged. This package requires `websockets>=14`, so it uses the `additional_headers` API and never falls back to an unaffinitized connection.
+   A `201` response returns `ingestion.ready: true` with the worker WebSocket
+   `url` and a one-time `wsToken` immediately.
+
+3. When the response has `ingestion.ready: false`, polls `GET {api_url}/sessions/{id}` using bounded backoff for up to 240 seconds until ready WebSocket credentials are available; `FAILED` or `ENDED` worker states stop the wait immediately. Room credentials from the initial response remain in memory and are not expected in the status response.
+4. Opens the returned WebSocket with the `facemode.<ws-token>` subprotocol (the `aivatar.` prefix is rejected by current backends), compression disabled, native keepalives disabled, a 240-second open timeout, and optional backend-provided `ingestion.headers` forwarded unchanged. This package requires `websockets>=14`, so it uses the `additional_headers` API and never falls back to an unaffinitized connection.
 5. Starts the receive task, sends canonical `start` from the pipeline `StartFrame`, and waits for a validated `started` response.
 6. Starts application keepalives only after negotiation succeeds, preserving the protocol requirement that `start` is the first application message.
 
@@ -115,6 +123,28 @@ The canonical protocol messages are used as follows:
 - `cancel_utterance` is sent for `StartInterruptionFrame`.
 - `ping` is sent periodically while the session is alive.
 - `end_session` is sent during graceful `EndFrame` or pipeline cleanup.
+
+## Automatic reconnect
+
+If the canonical WebSocket drops after a session was fully started, the service
+reconnects without caller-visible pipeline failure:
+
+1. It calls `POST {api_url}/sessions/{id}/reconnect` with the original `room`
+   object (plus the persisted `inputProvider` when configured). Every response
+   mints a fresh one-time `wsToken`; tokens are never reused.
+2. It opens a new socket with the `facemode.<new-token>` subprotocol, resends
+   the same `start` negotiation, and waits for `started` before audio resumes.
+3. At most 2 reconnect attempts run with bounded backoff. Recovery is
+   single-flight, so simultaneous close/error notifications share one attempt.
+
+Sequence numbers keep increasing across reconnects, an explicitly open
+utterance is re-declared on the new socket, and already-sent audio is never
+replayed. Sends that arrive during the gap wait for the new socket instead of
+failing. No reconnect is attempted on intentional shutdown (`EndFrame`,
+`CancelFrame`, `stop`, `cleanup`), on server-terminal states (`session_ending`,
+`ended`, fatal `error` messages), or before the session is fully started. When
+the reconnect budget is exhausted, the failure surfaces as a
+`FaceModeProtocolError` that never contains token or key material.
 
 The service calls `super().__init__()` and `super().process_frame(...)`, and
 forwards non-consumed frames with their original `FrameDirection`. Lifecycle and
@@ -196,7 +226,11 @@ format, then copied into a NumPy-backed RGB or RGBA image frame.
 ## Lifecycle and failure behavior
 
 - REST and WebSocket failures raise typed FaceMode exceptions without including
-  API keys or token values in log messages.
+  API keys or token values in log messages; `facemode.` credential prefixes are
+  redacted alongside `Bearer` material.
+- The ingestion-ready poll budget and the WebSocket open/handshake budget are
+  each 240 seconds. The `start`/`started` acknowledgement uses
+  `protocol_timeout` (default 15 seconds).
 - WebSocket receive, keepalive, audio, and video tasks are cancelled and awaited during `EndFrame`, `cleanup`, or a failed startup. Graceful shutdown sends `end_session` and waits up to three seconds for canonical `ended` before closing the socket.
 - `ended` is a WebSocket protocol acknowledgement, not proof that backend worker cleanup, provider cancellation, or billing finalization is complete. Callers that need backend cleanup confirmation poll the public session endpoint until it becomes terminal.
 - LiveKit tracks published before the connection are discovered after startup;

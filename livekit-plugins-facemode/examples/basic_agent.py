@@ -18,6 +18,9 @@ async def entrypoint(ctx: JobContext):
         api_key=os.environ["FACEMODE_API_KEY"],
         avatar_id=os.environ.get("FACEMODE_AVATAR_ID", ""),
         api_url=os.environ.get("FACEMODE_API_URL", "https://api.facemode.io/api"),
+        # Optional: pin the upstream input provider for the session.
+        # One of deepgram|gemini|gnani|elevenlabs|openai|cartesia|sarvam|custom.
+        input_provider=os.environ.get("FACEMODE_INPUT_PROVIDER") or None,
     )
     await ctx.connect()
     await avatar.start(
