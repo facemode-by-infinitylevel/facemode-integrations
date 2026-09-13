@@ -6,8 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "livekit-plugins-facemode"
 version = "0.1.0"
 license = {text = "Apache-2.0"}
-classi
-fiers = [
+classifiers = [
     "License :: OSI Approved :: Apache Software License"
 ]
 
