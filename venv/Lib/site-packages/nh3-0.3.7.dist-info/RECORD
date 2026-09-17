@@ -1,0 +1,11 @@
+nh3-0.3.7.dist-info/INSTALLER,sha256=zuuue4knoyJ-UwPPXg8fezS7VCrXJQrAP7zeNuwvFQg,4
+nh3-0.3.7.dist-info/METADATA,sha256=gHzll-0zoz93MCuyd-Uy5sb04hd4ufqAQrgra7Y1qVw,2037
+nh3-0.3.7.dist-info/RECORD,,
+nh3-0.3.7.dist-info/WHEEL,sha256=RD58zsFMg5Xm6opfRt5qGok5PcA30CAhknyKFSihcu8,95
+nh3-0.3.7.dist-info/licenses/LICENSE,sha256=-e6oWx1xxDXTDUdv8sEHowa8jgJ0t2UvJMw9ePEK0w8,1107
+nh3-0.3.7.dist-info/sboms/nh3.cyclonedx.json,sha256=XGoHVwfyMEvOLJmcS2IDfe962ZnY-iy-V1JqVaxgmBI,91846
+nh3/__init__.py,sha256=VbJi5tZirAK6HAbQpF4aZYp0_ScVJF7YB50E6NNLQw4,95
+nh3/__init__.pyi,sha256=BxM1A4d8Tv6pmS1Nfy2IaMJeeT-nLNYaPxYuXFgbLaQ,2599
+nh3/__pycache__/__init__.cpython-312.pyc,,
+nh3/nh3.pyd,sha256=ZLYcghnw7G97HyB5zVGoyEqQ-bI5aYvAV7APVTZJc4k,1677824
+nh3/py.typed,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0
