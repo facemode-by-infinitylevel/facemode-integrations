@@ -5,5 +5,11 @@ export {
   FaceModeProtocolError,
 } from './exceptions.js';
 export { parseSessionDetails } from './models.js';
-export type { IngestionDetails, LiveKitRoom, SessionDetails, SessionRequest } from './models.js';
+export type {
+  IngestionDetails,
+  LiveKitRoom,
+  SessionDetails,
+  SessionInputProvider,
+  SessionRequest,
+} from './models.js';
 export { VERSION } from './version.js';

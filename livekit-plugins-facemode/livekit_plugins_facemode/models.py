@@ -6,6 +6,19 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+SUPPORTED_INPUT_PROVIDERS = frozenset(
+    {
+        "deepgram",
+        "gemini",
+        "gnani",
+        "elevenlabs",
+        "openai",
+        "cartesia",
+        "sarvam",
+        "custom",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class LiveKitRoom:
@@ -60,17 +73,28 @@ class SessionRequest:
     avatar_id: str
     room: LiveKitRoom
     room_name: str = ""
-    wait_for_ingestion: bool = True
+    input_provider: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.input_provider is not None
+            and self.input_provider not in SUPPORTED_INPUT_PROVIDERS
+        ):
+            raise ValueError(
+                "input_provider must be one of: "
+                + ", ".join(sorted(SUPPORTED_INPUT_PROVIDERS))
+            )
 
     def to_payload(self) -> dict[str, Any]:
         """Return the room-object API wire representation."""
         payload: dict[str, Any] = {
             "avatarId": self.avatar_id,
             "room": self.room.to_payload(),
-            "waitForIngestion": self.wait_for_ingestion,
         }
         if self.room_name:
             payload["livekit_room_id"] = self.room_name
+        if self.input_provider:
+            payload["inputProvider"] = self.input_provider
         return payload
 
 
@@ -91,6 +115,7 @@ class SessionDetails:
     ingestion: IngestionDetails
     worker_status: str | None = None
     avatar_participant_identity: str | None = None
+    input_provider: str | None = None
 
     @classmethod
     def from_api(
@@ -165,6 +190,12 @@ class SessionDetails:
                 root.get("avatar_participant_identity"),
                 session.get("avatarParticipantIdentity"),
                 session.get("avatar_participant_identity"),
+            ),
+            input_provider=_first_optional_text(
+                root.get("inputProvider"),
+                root.get("input_provider"),
+                session.get("inputProvider"),
+                session.get("input_provider"),
             ),
         )
 

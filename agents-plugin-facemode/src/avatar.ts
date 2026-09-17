@@ -6,6 +6,7 @@ import {
   parseSessionDetails,
   type LiveKitRoom,
   type SessionDetails,
+  type SessionInputProvider,
   type SessionRequest,
 } from './models.js';
 
@@ -15,11 +16,15 @@ export type StartOptions = {
 
 const MIN_INPUT_SAMPLE_RATE = 8000;
 const MAX_INPUT_SAMPLE_RATE = 48000;
-const INGESTION_READY_TIMEOUT_MS = 60000;
+export const INGESTION_READY_TIMEOUT_MS = 240000;
+export const WS_HANDSHAKE_TIMEOUT_MS = 240000;
 const INGESTION_INITIAL_RETRY_MS = 250;
 const INGESTION_MAX_RETRY_MS = 2000;
 const APPLICATION_KEEPALIVE_MS = 15000;
 const END_ACK_TIMEOUT_MS = 3000;
+const PROTOCOL_RESPONSE_TIMEOUT_MS = 15000;
+const RECONNECT_MAX_ATTEMPTS = 2;
+const RECONNECT_BACKOFF_MS = 500;
 const PREFERRED_SAMPLE_RATES = new Set([
   8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000,
 ]);
@@ -35,6 +40,12 @@ type ProtocolStarted = {
   reject: (error: Error) => void;
   promise: Promise<void>;
   sent?: boolean;
+};
+
+type ReconnectAttempt = {
+  socket: WebSocket;
+  closed: ProtocolStarted;
+  closeCode?: number;
 };
 
 type InputFormat = {
@@ -53,6 +64,7 @@ function deferred(): ProtocolStarted {
     resolvePromise = resolve;
     rejectPromise = reject;
   });
+  promise.catch(() => undefined);
   return { resolve: resolvePromise, reject: rejectPromise, promise };
 }
 
@@ -96,6 +108,7 @@ export class AvatarSession extends voice.AvatarSession {
   readonly avatarId: string;
   readonly apiKey: string;
   readonly apiUrl: string;
+  readonly inputProvider: SessionInputProvider | undefined;
   avatarParticipantIdentity: string;
   readonly avatarParticipantName: string;
 
@@ -114,6 +127,9 @@ export class AvatarSession extends voice.AvatarSession {
   private sessionLogMarker: string | null = null;
   private sequence = 0;
   private stopped = false;
+  private sessionTerminated = false;
+  private reconnectPromise: Promise<void> | null = null;
+  private reconnectAttempt: ReconnectAttempt | null = null;
 
   constructor(options: {
     apiKey: string;
@@ -121,6 +137,7 @@ export class AvatarSession extends voice.AvatarSession {
     apiUrl?: string;
     avatarParticipantIdentity?: string;
     avatarParticipantName?: string;
+    inputProvider?: SessionInputProvider;
   }) {
     super();
     if (!options.apiKey) throw new Error('apiKey is required');
@@ -129,6 +146,7 @@ export class AvatarSession extends voice.AvatarSession {
     this.apiUrl = (options.apiUrl ?? 'https://api.facemode.io/api').replace(/\/+$/, '');
     this.avatarParticipantIdentity = options.avatarParticipantIdentity ?? 'facemode-avatar';
     this.avatarParticipantName = options.avatarParticipantName ?? 'FaceMode Avatar';
+    this.inputProvider = options.inputProvider;
   }
 
   get avatarIdentity(): string {
@@ -158,6 +176,7 @@ export class AvatarSession extends voice.AvatarSession {
       baseStarted = true;
       this.room = room;
       this.stopped = false;
+      this.sessionTerminated = false;
       this.sequence = 0;
       this.protocolStartedAck = false;
       this.protocolError = null;
@@ -243,10 +262,15 @@ export class AvatarSession extends voice.AvatarSession {
   }
 
   async ensureProtocolStarted(sampleRate: number, channels: number): Promise<void> {
+    const pendingReconnect = this.reconnectPromise;
+    if (pendingReconnect && !this.stopped && !this.sessionTerminated) {
+      await pendingReconnect;
+    }
     if (this.protocolError) throw this.protocolError;
+    const socket = this.websocket;
     if (
-      !this.websocket
-      || this.websocket.readyState !== WebSocket.OPEN
+      !socket
+      || socket.readyState !== WebSocket.OPEN
       || !this.session
       || !this.protocolStarted
     ) {
@@ -264,23 +288,16 @@ export class AvatarSession extends voice.AvatarSession {
     }
     this.inputFormat ??= inputFormat;
 
-    if (this.protocolStarted.sent) {
-      await this.protocolStarted.promise;
+    const pending = this.protocolStarted;
+    if (pending.sent) {
+      await pending.promise;
       if (this.protocolError) throw this.protocolError;
       return;
     }
 
-    this.protocolStarted.sent = true;
-    this.websocket.send(JSON.stringify({
-      type: 'start',
-      session_id: this.session.sessionId,
-      audio_encoding: 'pcm_s16le',
-      sample_rate: inputFormat.sampleRate,
-      channels: inputFormat.channels,
-      avatar_id: this.avatarId,
-      metadata: { source: 'livekit-agents-js' },
-    }));
-    await waitWithTimeout(this.protocolStarted.promise, 15000, 'FaceMode protocol negotiation timed out');
+    pending.sent = true;
+    socket.send(this.buildStartMessage());
+    await waitWithTimeout(pending.promise, PROTOCOL_RESPONSE_TIMEOUT_MS, 'FaceMode protocol negotiation timed out');
     if (this.protocolError) throw this.protocolError;
     if (!this.protocolStartedAck) {
       throw new FaceModeProtocolError('FaceMode protocol negotiation did not start');
@@ -288,9 +305,6 @@ export class AvatarSession extends voice.AvatarSession {
   }
 
   async sendAudioFrame(frame: AudioFrame): Promise<void> {
-    if (!this.websocket || this.websocket.readyState !== WebSocket.OPEN) {
-      throw this.protocolError ?? new FaceModeProtocolError('FaceMode WebSocket is not connected');
-    }
     if (!this.inputFormat) {
       throw new FaceModeProtocolError('FaceMode audio was sent before protocol negotiation');
     }
@@ -310,19 +324,210 @@ export class AvatarSession extends voice.AvatarSession {
         `LiveKit PCM frame is not aligned to ${this.inputFormat.channels} channel 16-bit samples`,
       );
     }
-    this.websocket.send(buffer);
+    await this.deliverPayload(buffer);
   }
 
   async sendControl(type: string, seq: number): Promise<void> {
-    if (!this.websocket || this.websocket.readyState !== WebSocket.OPEN) {
-      if (this.stopped) return;
-      throw this.protocolError ?? new FaceModeProtocolError('FaceMode WebSocket is not connected');
-    }
-    this.websocket.send(JSON.stringify({ type, seq }));
+    await this.deliverPayload(JSON.stringify({ type, seq }));
   }
 
   nextSequence(): number {
     return this.sequence++;
+  }
+
+  reconnect(): Promise<void> {
+    if (this.reconnectPromise) return this.reconnectPromise;
+    if (this.stopped || this.sessionTerminated || !this.session || !this.inputFormat) {
+      return Promise.resolve();
+    }
+    const promise = (async () => {
+      try {
+        await this.performReconnect();
+      } catch (error) {
+        this.setProtocolError(error instanceof Error ? error : new Error(String(error)));
+      } finally {
+        this.reconnectPromise = null;
+      }
+    })();
+    this.reconnectPromise = promise;
+    return promise;
+  }
+
+  private async performReconnect(): Promise<void> {
+    const session = this.session;
+    const inputFormat = this.inputFormat;
+    if (!session || !inputFormat) return;
+    this.protocolStartedAck = false;
+    let lastError: Error | null = null;
+    for (let attempt = 1; attempt <= RECONNECT_MAX_ATTEMPTS; attempt += 1) {
+      if (this.stopped || this.sessionTerminated || this.protocolError) return;
+      if (attempt > 1) await sleep(RECONNECT_BACKOFF_MS);
+      if (this.stopped || this.sessionTerminated || this.protocolError) return;
+      let socket: WebSocket;
+      try {
+        const fresh = await this.requestReconnectCredentials(session);
+        const url = fresh.ingestion.url;
+        const wsToken = fresh.ingestion.wsToken;
+        if (!fresh.ingestion.ready || !url || !wsToken) {
+          throw new FaceModeApiError('FaceMode reconnect did not return usable WebSocket credentials');
+        }
+        if (fresh.workerStatus === 'FAILED' || fresh.workerStatus === 'ENDED') {
+          throw new FaceModeApiError(`FaceMode session entered ${fresh.workerStatus.toLowerCase()} state`);
+        }
+        socket = await this.connectWebSocket(url, wsToken, fresh.ingestion.headers);
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        continue;
+      }
+      if (this.stopped || this.sessionTerminated || this.protocolError) {
+        this.teardownSocket(socket);
+        return;
+      }
+      this.websocket = socket;
+      const attemptState: ReconnectAttempt = { socket, closed: deferred() };
+      this.reconnectAttempt = attemptState;
+      const started = deferred();
+      this.protocolStarted = started;
+      started.sent = true;
+      this.protocolStartedAck = false;
+      this.bindWebSocketEvents(socket);
+      try {
+        socket.send(this.buildStartMessage());
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        this.reconnectAttempt = null;
+        this.teardownSocket(socket);
+        if (this.websocket === socket) this.websocket = null;
+        continue;
+      }
+      let timer: NodeJS.Timeout | undefined;
+      const outcome = await Promise.race([
+        started.promise.then(
+          (): 'started' => 'started',
+          (error: unknown): Error => (error instanceof Error ? error : new Error(String(error))),
+        ),
+        attemptState.closed.promise.then((): 'closed' => 'closed'),
+        new Promise<'timeout'>((resolve) => {
+          timer = setTimeout(() => resolve('timeout'), PROTOCOL_RESPONSE_TIMEOUT_MS);
+        }),
+      ]).finally(() => {
+        if (timer) clearTimeout(timer);
+      });
+      if (this.reconnectAttempt === attemptState) this.reconnectAttempt = null;
+      if (outcome === 'started' && socket.readyState === WebSocket.OPEN && this.websocket === socket) {
+        this.startApplicationKeepalive();
+        log().info({ session: this.sessionLogMarker }, 'FaceMode WebSocket reconnected');
+        return;
+      }
+      this.teardownSocket(socket);
+      if (this.websocket === socket) this.websocket = null;
+      this.protocolStartedAck = false;
+      if (this.protocolError) return;
+      lastError = outcome instanceof Error
+        ? outcome
+        : new FaceModeProtocolError(
+            outcome === 'timeout'
+              ? 'FaceMode reconnect timed out waiting for protocol start'
+              : `FaceMode reconnect socket closed before protocol start${attemptState.closeCode !== undefined ? ` (code=${attemptState.closeCode})` : ''}`,
+          );
+    }
+    this.setProtocolError(new FaceModeProtocolError(
+      `FaceMode reconnect failed after ${RECONNECT_MAX_ATTEMPTS} attempts${lastError ? ` (${safeErrorType(lastError)})` : ''}`,
+    ));
+  }
+
+  private async requestReconnectCredentials(session: SessionDetails): Promise<SessionDetails> {
+    const response = await fetch(`${this.apiUrl}/sessions/${encodeURIComponent(session.sessionId)}/reconnect`, {
+      method: 'POST',
+      headers: this.apiHeaders(),
+      body: JSON.stringify({ room: session.room }),
+    });
+    const payload = await parseApiJson(response, 'FaceMode session reconnect');
+    return parseSessionDetails(payload, {
+      sessionId: session.sessionId,
+      room: session.room,
+      roomName: session.roomName,
+    });
+  }
+
+  private buildStartMessage(): string {
+    const session = this.session;
+    const inputFormat = this.inputFormat;
+    if (!session || !inputFormat) {
+      throw new FaceModeProtocolError('FaceMode session is not ready to start');
+    }
+    return JSON.stringify({
+      type: 'start',
+      session_id: session.sessionId,
+      audio_encoding: 'pcm_s16le',
+      sample_rate: inputFormat.sampleRate,
+      channels: inputFormat.channels,
+      avatar_id: this.avatarId,
+      metadata: { source: 'livekit-agents-js' },
+    });
+  }
+
+  private async writableSocket(): Promise<WebSocket | null> {
+    // Yield one microtask so a reconnect() triggered synchronously after the
+    // caller invoked send* is observed before the socket is chosen.
+    await Promise.resolve();
+    const pending = this.reconnectPromise;
+    if (pending && !this.stopped && !this.sessionTerminated) {
+      await pending;
+    }
+    if (this.protocolError) throw this.protocolError;
+    const current = this.websocket;
+    if (current && current.readyState === WebSocket.OPEN) return current;
+    if (this.stopped || this.sessionTerminated || !this.session || !this.inputFormat) {
+      return null;
+    }
+    await this.reconnect();
+    if (this.protocolError) throw this.protocolError;
+    const next = this.websocket;
+    return next && next.readyState === WebSocket.OPEN ? next : null;
+  }
+
+  private async deliverPayload(payload: string | Buffer): Promise<void> {
+    for (;;) {
+      const socket = await this.writableSocket();
+      if (!socket) {
+        if (this.stopped || this.sessionTerminated) return;
+        throw this.protocolError ?? new FaceModeProtocolError('FaceMode WebSocket is not connected');
+      }
+      try {
+        socket.send(payload);
+      } catch (error) {
+        if (this.stopped) return;
+        if (socket.readyState === WebSocket.OPEN) {
+          throw error instanceof Error ? error : new FaceModeProtocolError('FaceMode WebSocket send failed');
+        }
+        await this.reconnect();
+        continue;
+      }
+      // Resolve only after the write has had at least one full event-loop
+      // turn to reach the peer; send() returning does not mean delivery.
+      await nextCheckPhase();
+      await nextCheckPhase();
+      return;
+    }
+  }
+
+  private teardownSocket(socket: WebSocket): void {
+    try {
+      socket.removeAllListeners();
+    } catch {
+      // defensive cleanup only
+    }
+    try {
+      socket.close();
+    } catch {
+      // the transport is already gone
+    }
+    try {
+      socket.terminate();
+    } catch {
+      // not every socket test double implements terminate
+    }
   }
 
   private async createSession(room: LiveKitRoom, roomName: string): Promise<SessionDetails> {
@@ -330,7 +535,7 @@ export class AvatarSession extends voice.AvatarSession {
       avatarId: this.avatarId,
       room,
       livekit_room_id: roomName,
-      waitForIngestion: true,
+      ...(this.inputProvider ? { inputProvider: this.inputProvider } : {}),
     };
     const response = await fetch(`${this.apiUrl}/sessions`, {
       method: 'POST',
@@ -346,6 +551,9 @@ export class AvatarSession extends voice.AvatarSession {
     let delay = INGESTION_INITIAL_RETRY_MS;
     const deadline = Date.now() + INGESTION_READY_TIMEOUT_MS;
     while (!session.ingestion.ready) {
+      if (session.workerStatus === 'FAILED' || session.workerStatus === 'ENDED') {
+        throw new FaceModeApiError(`FaceMode ingestion worker entered ${session.workerStatus.toLowerCase()} state`);
+      }
       if (Date.now() >= deadline) {
         throw new FaceModeApiError('Timed out waiting for FaceMode ingestion assignment');
       }
@@ -379,8 +587,8 @@ export class AvatarSession extends voice.AvatarSession {
     headers?: Readonly<Record<string, string>>,
   ): Promise<WebSocket> {
     return new Promise((resolve, reject) => {
-      const socket = new WebSocket(url, [`aivatar.${token}`], {
-        handshakeTimeout: 60000,
+      const socket = new WebSocket(url, [`facemode.${token}`], {
+        handshakeTimeout: WS_HANDSHAKE_TIMEOUT_MS,
         perMessageDeflate: false,
         ...(headers ? { headers: { ...headers } } : {}),
       });
@@ -406,23 +614,54 @@ export class AvatarSession extends voice.AvatarSession {
   }
 
   private bindWebSocketEvents(socket: WebSocket): void {
-    socket.on('message', (data) => this.handleMessage(data.toString()));
-    socket.on('error', (error) => {
-      const protocolError = error instanceof Error ? error : new Error(String(error));
-      this.setProtocolError(protocolError);
-    });
-    socket.on('close', (code) => {
-      this.stopApplicationKeepalive();
-      if (this.stopped) return;
-      const protocolError = new FaceModeProtocolError(
-        `FaceMode WebSocket closed unexpectedly (code=${code})`,
-      );
-      this.setProtocolError(protocolError);
-      log().warn(
-        { session: this.sessionLogMarker, code },
-        'FaceMode WebSocket closed unexpectedly',
-      );
-    });
+    socket.on('message', (data) => this.handleMessage(socket, data.toString()));
+    socket.on('error', (error) => this.handleSocketError(socket, error));
+    socket.on('close', (code) => this.handleSocketClosed(socket, code));
+  }
+
+  private handleSocketError(socket: WebSocket, error: unknown): void {
+    const attempt = this.reconnectAttempt;
+    if (attempt && attempt.socket === socket) {
+      attempt.closed.resolve();
+      return;
+    }
+    if (socket !== this.websocket) return;
+    if (this.stopped || this.sessionTerminated) return;
+    const protocolError = error instanceof Error ? error : new Error(String(error));
+    if (!this.protocolStartedAck) {
+      if (!this.reconnectPromise) this.setProtocolError(protocolError);
+      return;
+    }
+    log().warn(
+      { session: this.sessionLogMarker, errorType: safeErrorType(protocolError) },
+      'FaceMode WebSocket reported an error',
+    );
+  }
+
+  private handleSocketClosed(socket: WebSocket, code: number): void {
+    this.teardownSocket(socket);
+    if (this.websocket === socket) this.websocket = null;
+    const attempt = this.reconnectAttempt;
+    if (attempt && attempt.socket === socket) {
+      this.reconnectAttempt = null;
+      attempt.closeCode = code;
+      attempt.closed.resolve();
+      return;
+    }
+    this.stopApplicationKeepalive();
+    if (this.stopped || this.sessionTerminated) return;
+    if (this.protocolError) return;
+    if (!this.protocolStartedAck) {
+      if (!this.reconnectPromise) {
+        this.setProtocolError(new FaceModeProtocolError(`FaceMode WebSocket closed unexpectedly (code=${code})`));
+      }
+      return;
+    }
+    log().warn(
+      { session: this.sessionLogMarker, code },
+      'FaceMode WebSocket closed unexpectedly',
+    );
+    void this.reconnect();
   }
 
   private async negotiateConfiguredTts(agentSession: voice.AgentSession): Promise<void> {
@@ -452,8 +691,13 @@ export class AvatarSession extends voice.AvatarSession {
   }
 
   private setProtocolError(error: Error): void {
-    if (!this.protocolError) this.protocolError = error;
-    this.protocolStarted?.reject(error);
+    const terminal = this.protocolError ?? error;
+    this.protocolError = terminal;
+    const started = this.protocolStarted;
+    if (started) {
+      started.promise.catch(() => undefined);
+      started.reject(terminal);
+    }
   }
 
   private async rollbackStart(baseStarted: boolean): Promise<void> {
@@ -502,9 +746,11 @@ export class AvatarSession extends voice.AvatarSession {
     this.avatarVideoResolve = null;
     this.inputFormat = null;
     this.sessionLogMarker = null;
+    this.sessionTerminated = false;
   }
 
-  private handleMessage(raw: string): void {
+  private handleMessage(socket: WebSocket, raw: string): void {
+    if (socket !== this.websocket && socket !== this.reconnectAttempt?.socket) return;
     let message: Record<string, unknown>;
     try {
       message = JSON.parse(raw) as Record<string, unknown>;
@@ -531,6 +777,7 @@ export class AvatarSession extends voice.AvatarSession {
     } else if (message.type === 'session_ending') {
       this.setProtocolError(new FaceModeProtocolError(`FaceMode session is ending: ${String(message.reason ?? 'unknown')}`));
     } else if (message.type === 'ended') {
+      this.sessionTerminated = true;
       this.sessionEnded?.resolve();
     } else if (message.type === 'audio_ready') {
       this.avatarVideoResolve?.();
@@ -607,6 +854,10 @@ function waitWithTimeout(promise: Promise<void>, timeout: number, message: strin
 
 function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function nextCheckPhase(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 function sanitizeSessionMarker(sessionId: string): string {

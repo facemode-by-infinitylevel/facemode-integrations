@@ -50,7 +50,13 @@ await agent_session.start(
 await avatar.wait_for_join()
 ```
 
-`AvatarSession.start()` creates a FaceMode session with the room object and `waitForIngestion: true`. If worker assignment is pending, it polls the session endpoint with bounded backoff before opening the canonical WebSocket. The initial response's room credentials remain in memory and are not expected in the polling response. When the backend returns optional `ingestion.headers`, the plugin forwards them during the WebSocket handshake. It disables compression and native WebSocket keepalives in favor of the canonical application `ping`/`pong` messages after negotiation.
+`AvatarSession.start()` creates a FaceMode session with the room object. The create response normally returns `ready: true` with the ingestion `url` and a one-time `wsToken` (about 15 minute expiry), so no polling happens in the common path. If worker assignment is still pending, the plugin polls the session endpoint with bounded backoff for up to 240 seconds and stops immediately on `FAILED`/`ENDED` worker states. The initial response's room credentials remain in memory and are not expected in the polling response.
+
+The ingestion WebSocket handshake uses the `Sec-WebSocket-Protocol` subprotocol `facemode.<wsToken>` (the older `aivatar.` prefix is rejected) with a 240 second open timeout. When the backend returns optional `ingestion.headers`, the plugin forwards them during the handshake. It disables compression and native WebSocket keepalives in favor of the canonical application `ping`/`pong` messages after negotiation.
+
+Pass `input_provider` (one of `deepgram`, `gemini`, `gnani`, `elevenlabs`, `openai`, `cartesia`, `sarvam`, `custom`) to `AvatarSession` when the session should pin a specific upstream input provider; it is omitted from the request otherwise.
+
+If the WebSocket transport drops after the protocol has started, the plugin auto-reconnects in the background: it POSTs the session reconnect endpoint for a fresh one-time `wsToken` (a consumed token is never reused), opens a new socket with `facemode.<newToken>`, re-sends the canonical `start` message, and waits for `started` before resuming. Outgoing control `seq` numbers stay monotonic across the reconnect and buffered audio is not replayed. Reconnect is bounded to 2 attempts with backoff and is single-flight; exhaustion surfaces a typed `FaceModeNotReadyError`/`FaceModeAPIError`. Intentional `stop()`, a canonical `ended`, fatal protocol errors, and drops before the first negotiation do not reconnect.
 
 Every TTS frame is sent as canonical PCM audio. The plugin locks sample rate and channel count at protocol negotiation and rejects a format change or unaligned 16-bit PCM afterward. `cancel_utterance` is sent when LiveKit interrupts the audio output. Graceful close sends `end_session` and waits briefly for canonical `ended`; `ended` is a protocol acknowledgement, not backend cleanup confirmation.
 

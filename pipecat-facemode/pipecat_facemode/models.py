@@ -60,15 +60,16 @@ class SessionRequest:
     avatar_id: str
     room: LiveKitRoom
     room_name: str = ""
-    wait_for_ingestion: bool = True
+    input_provider: str | None = None
 
     def to_payload(self) -> dict[str, Any]:
         """Return the room-object API wire representation."""
         payload: dict[str, Any] = {
             "avatarId": self.avatar_id,
             "room": self.room.to_payload(),
-            "waitForIngestion": self.wait_for_ingestion,
         }
+        if self.input_provider:
+            payload["inputProvider"] = self.input_provider
         if self.room_name:
             payload["livekit_room_id"] = self.room_name
         return payload
@@ -95,6 +96,7 @@ class SessionDetails:
     ingestion: IngestionDetails = field(repr=False)
     worker_status: str | None = None
     avatar_participant_identity: str | None = None
+    input_provider: str | None = None
 
     @classmethod
     def from_api(
@@ -120,6 +122,7 @@ class SessionDetails:
             root.get("sessionId"),
             root.get("id"),
             root.get("jobId"),
+            fallback.session_id if fallback else None,
         )
         if not session_id:
             raise ValueError("FaceMode session response is missing a session ID")
@@ -129,16 +132,27 @@ class SessionDetails:
             ingestion.get("websocketUrl"),
             root.get("websocketUrl"),
             root.get("websocket_url"),
+            root.get("url"),
+            fallback.ingestion.url if fallback else None,
         )
         ws_token = _first_text(
             ingestion.get("wsToken"),
             ingestion.get("ws_token"),
             ingestion.get("token"),
+            root.get("wsToken"),
+            root.get("ws_token"),
             root.get("ingestionToken"),
             root.get("ingestion_token"),
+            fallback.ingestion.ws_token if fallback else None,
         )
-        ready = ingestion.get("ready") is True or (
-            "ready" not in ingestion and bool(ingestion_url and ws_token)
+        ready = (
+            ingestion.get("ready") is True
+            or root.get("ready") is True
+            or (
+                "ready" not in ingestion
+                and "ready" not in root
+                and bool(ingestion_url and ws_token)
+            )
         )
         if ready and (not ingestion_url or not ws_token):
             raise ValueError("FaceMode reported ready ingestion without WebSocket credentials")
@@ -155,20 +169,35 @@ class SessionDetails:
                 ready=ready,
                 url=ingestion_url,
                 ws_token=ws_token,
-                authority=_first_optional_text(ingestion.get("authority")),
-                headers=_parse_headers(ingestion.get("headers")),
+                authority=_first_optional_text(
+                    ingestion.get("authority"),
+                    fallback.ingestion.authority if fallback else None,
+                ),
+                headers=(
+                    _parse_headers(ingestion.get("headers"))
+                    or (dict(fallback.ingestion.headers) if fallback else {})
+                ),
             ),
             worker_status=_first_optional_text(
                 root.get("workerStatus"),
                 root.get("worker_status"),
                 session.get("workerStatus"),
                 session.get("worker_status"),
+                fallback.worker_status if fallback else None,
             ),
             avatar_participant_identity=_first_optional_text(
                 root.get("avatarParticipantIdentity"),
                 root.get("avatar_participant_identity"),
                 session.get("avatarParticipantIdentity"),
                 session.get("avatar_participant_identity"),
+                fallback.avatar_participant_identity if fallback else None,
+            ),
+            input_provider=_first_optional_text(
+                root.get("inputProvider"),
+                root.get("input_provider"),
+                session.get("inputProvider"),
+                session.get("input_provider"),
+                fallback.input_provider if fallback else None,
             ),
         )
 

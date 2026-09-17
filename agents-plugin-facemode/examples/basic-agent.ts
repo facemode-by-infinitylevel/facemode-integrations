@@ -22,6 +22,9 @@ export default defineAgent({
       apiKey: process.env.FACEMODE_API_KEY ?? '',
       avatarId: process.env.FACEMODE_AVATAR_ID,
       apiUrl: process.env.FACEMODE_API_URL,
+      // Optional session input provider: deepgram | gemini | gnani |
+      // elevenlabs | openai | cartesia | sarvam | custom.
+      inputProvider: 'deepgram',
     });
     await ctx.connect();
     await avatar.start(session, ctx.room, {

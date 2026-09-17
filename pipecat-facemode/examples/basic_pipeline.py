@@ -14,6 +14,8 @@ Required environment variables:
     FACEMODE_AVATAR_PARTICIPANT_IDENTITY (optional, defaults to facemode-avatar)
     LIVEKIT_TRANSPORT_TOKEN
     CARTESIA_API_KEY
+    FACEMODE_INPUT_PROVIDER (optional: deepgram, gemini, gnani, elevenlabs,
+        openai, cartesia, sarvam, or custom)
 
 Install the optional Pipecat LiveKit transport and Cartesia service before running:
 
@@ -78,8 +80,13 @@ async def main() -> None:
         avatar_participant_identity=os.environ.get(
             "FACEMODE_AVATAR_PARTICIPANT_IDENTITY", "facemode-avatar"
         ),
+        input_provider=os.environ.get("FACEMODE_INPUT_PROVIDER") or None,
         room_name=required("LIVEKIT_ROOM_NAME"),
     )
+    # If the FaceMode WebSocket drops after startup, the service automatically
+    # fetches a fresh one-time credential via the session reconnect endpoint,
+    # renegotiates start/started on the new socket, and resumes without a
+    # pipeline-visible failure. Intentional shutdowns never reconnect.
 
     # FaceMode consumes TTSAudioRawFrame and emits OutputAudioRawFrame plus an
     # output video frame. Do not put another audio output before this service or

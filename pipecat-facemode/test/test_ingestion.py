@@ -160,12 +160,12 @@ class PipecatIngestionTests(unittest.IsolatedAsyncioTestCase):
 
         connect.assert_awaited_once_with(
             "wss://worker.example.test/ws/session-123",
-            subprotocols=["aivatar.one-time-token"],
+            subprotocols=["facemode.one-time-token"],
             additional_headers={"X-Runpod-Worker-Id": "strict worker-123"},
             max_size=2**20,
             ping_interval=None,
             compression=None,
-            open_timeout=60,
+            open_timeout=240,
         )
 
 
