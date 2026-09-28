@@ -4,11 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pipecat-facemode"
-version = "0.1.0"
+version = "0.2.0"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
+authors = [{name = "FaceMode"}]
+keywords = ["pipecat", "avatar", "facemode", "ai", "video", "realtime", "livekit"]
 classifiers = [
-    "Programming Language :: Python :: 3",
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
 ]
 
 description = "FaceMode avatar integration for Pipecat"
@@ -21,6 +26,10 @@ dependencies = [
     "websockets>=14,<17",
     "numpy>=2,<3",
 ]
+
+[project.urls]
+Homepage = "https://facemode.io"
+Repository = "https://github.com/facemode-by-infinitylevel/facemode-integrations"
 
 [tool.setuptools.packages.find]
 include = ["pipecat_facemode*"]

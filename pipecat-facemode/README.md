@@ -17,17 +17,17 @@ source TTS audio and the avatar's returned audio from being played twice. Set
 
 ## Install
 
-```powershell
+```bash
 pip install pipecat-facemode
 ```
 
 From this directory:
 
-```powershell
+```bash
 pip install .
 ```
 
-The package supports Pipecat 1.7 through the current 1.x line, LiveKit RTC 1.x, aiohttp 3.x, websockets 14 through 16, and NumPy 2.x.
+The package supports Pipecat 1.7 through the current 1.x line, LiveKit RTC 1.x, aiohttp 3.x, websockets 14 through 16, and NumPy 2.x. Requires Python 3.13 or later.
 
 ## Basic usage
 
@@ -105,7 +105,7 @@ On `StartFrame`, the service:
    `url` and a one-time `wsToken` immediately.
 
 3. When the response has `ingestion.ready: false`, polls `GET {api_url}/sessions/{id}` using bounded backoff for up to 240 seconds until ready WebSocket credentials are available; `FAILED` or `ENDED` worker states stop the wait immediately. Room credentials from the initial response remain in memory and are not expected in the status response.
-4. Opens the returned WebSocket with the `facemode.<ws-token>` subprotocol (the `aivatar.` prefix is rejected by current backends), compression disabled, native keepalives disabled, a 240-second open timeout, and optional backend-provided `ingestion.headers` forwarded unchanged. This package requires `websockets>=14`, so it uses the `additional_headers` API and never falls back to an unaffinitized connection.
+4. Opens the returned WebSocket with the `facemode.<ws-token>` subprotocol, compression disabled, native keepalives disabled, a 240-second open timeout, and optional backend-provided `ingestion.headers` forwarded unchanged. This package requires `websockets>=14`, so it uses the `additional_headers` API and never falls back to an unaffinitized connection.
 5. Starts the receive task, sends canonical `start` from the pipeline `StartFrame`, and waits for a validated `started` response.
 6. Starts application keepalives only after negotiation succeeds, preserving the protocol requirement that `start` is the first application message.
 
@@ -239,3 +239,7 @@ format, then copied into a NumPy-backed RGB or RGBA image frame.
   other remote participants. Set it to the identity in the worker room token when
   that token uses a different identity. The local subscriber track is always
   ignored.
+
+## License
+
+Apache-2.0 - see [LICENSE](LICENSE). Part of the [facemode-integrations](https://github.com/facemode-by-infinitylevel/facemode-integrations) monorepo.

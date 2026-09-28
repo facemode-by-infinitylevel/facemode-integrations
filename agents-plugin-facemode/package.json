@@ -1,7 +1,16 @@
 {
   "name": "@facemode/agents-plugin-facemode",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "FaceMode avatar integration for LiveKit Agents",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/facemode-by-infinitylevel/facemode-integrations.git",
+    "directory": "agents-plugin-facemode"
+  },
+  "homepage": "https://facemode.io",
+  "keywords": ["livekit", "agents", "avatar", "facemode", "ai", "video", "realtime"],
+  "author": "FaceMode",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -29,5 +38,6 @@
     "@types/node": "22.15.30",
     "@types/ws": "8.18.1",
     "typescript": "5.8.3"
-  }
+  },
+  "publishConfig": {"access": "public"}
 }

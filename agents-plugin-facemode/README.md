@@ -4,16 +4,18 @@ FaceMode avatar output for LiveKit Agents JavaScript applications.
 
 ## Install
 
-```powershell
+```bash
 npm install @facemode/agents-plugin-facemode
 ```
 
 From this repository:
 
-```powershell
+```bash
 npm install
 npm run build
 ```
+
+Requires Node.js 20 or later and `@livekit/agents` 1.x.
 
 ## Usage
 
@@ -97,3 +99,7 @@ room. Keep the token server-side and do not expose it to browser clients.
 
 The default API URL is `https://api.facemode.io/api`. Set `apiUrl` for a
 self-hosted or local backend.
+
+## License
+
+Apache-2.0 - see [LICENSE](LICENSE). Part of the [facemode-integrations](https://github.com/facemode-by-infinitylevel/facemode-integrations) monorepo.

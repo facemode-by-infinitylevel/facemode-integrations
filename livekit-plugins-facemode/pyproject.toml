@@ -4,11 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "livekit-plugins-facemode"
-version = "0.1.0"
+version = "0.2.0"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
+readme = "README.md"
+authors = [{name = "FaceMode"}]
+keywords = ["livekit", "agents", "avatar", "facemode", "ai", "video", "realtime"]
 classifiers = [
-    "Programming Language :: Python :: 3",
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
 ]
 
 description = "FaceMode avatar integration for LiveKit Agents"
@@ -19,6 +25,10 @@ dependencies = [
     "livekit-agents>=1.7,<2",
     "websockets>=14,<17",
 ]
+
+[project.urls]
+Homepage = "https://facemode.io"
+Repository = "https://github.com/facemode-by-infinitylevel/facemode-integrations"
 
 [tool.setuptools.packages.find]
 include = ["livekit_plugins_facemode*"]

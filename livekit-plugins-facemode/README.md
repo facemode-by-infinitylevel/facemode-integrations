@@ -4,15 +4,17 @@ FaceMode avatar output for LiveKit Agents Python applications.
 
 ## Install
 
-```powershell
+```bash
 pip install livekit-plugins-facemode
 ```
 
 From this repository:
 
-```powershell
+```bash
 pip install .
 ```
+
+Requires Python 3.13 or later, LiveKit 1.x, and LiveKit Agents 1.7 or later.
 
 ## Usage
 
@@ -52,7 +54,7 @@ await avatar.wait_for_join()
 
 `AvatarSession.start()` creates a FaceMode session with the room object. The create response normally returns `ready: true` with the ingestion `url` and a one-time `wsToken` (about 15 minute expiry), so no polling happens in the common path. If worker assignment is still pending, the plugin polls the session endpoint with bounded backoff for up to 240 seconds and stops immediately on `FAILED`/`ENDED` worker states. The initial response's room credentials remain in memory and are not expected in the polling response.
 
-The ingestion WebSocket handshake uses the `Sec-WebSocket-Protocol` subprotocol `facemode.<wsToken>` (the older `aivatar.` prefix is rejected) with a 240 second open timeout. When the backend returns optional `ingestion.headers`, the plugin forwards them during the handshake. It disables compression and native WebSocket keepalives in favor of the canonical application `ping`/`pong` messages after negotiation.
+The ingestion WebSocket handshake uses the `Sec-WebSocket-Protocol` subprotocol `facemode.<wsToken>` with a 240 second open timeout. When the backend returns optional `ingestion.headers`, the plugin forwards them during the handshake. It disables compression and native WebSocket keepalives in favor of the canonical application `ping`/`pong` messages after negotiation.
 
 Pass `input_provider` (one of `deepgram`, `gemini`, `gnani`, `elevenlabs`, `openai`, `cartesia`, `sarvam`, `custom`) to `AvatarSession` when the session should pin a specific upstream input provider; it is omitted from the request otherwise.
 
@@ -71,3 +73,7 @@ identity. The worker does not create or replace the customer LiveKit room.
 
 The default API URL is `https://api.facemode.io/api`. Set `api_url` for a
 self-hosted or local backend.
+
+## License
+
+Apache-2.0 - see [LICENSE](LICENSE). Part of the [facemode-integrations](https://github.com/facemode-by-infinitylevel/facemode-integrations) monorepo.
