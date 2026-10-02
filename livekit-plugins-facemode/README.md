@@ -1,6 +1,6 @@
 # livekit-plugins-facemode
 
-FaceMode avatar output for LiveKit Agents Python applications.
+[FaceMode](https://facemode.io) avatar output for LiveKit Agents Python applications.
 
 ## Install
 

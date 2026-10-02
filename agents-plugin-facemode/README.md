@@ -1,6 +1,6 @@
 # @facemode/agents-plugin-facemode
 
-FaceMode avatar output for LiveKit Agents JavaScript applications.
+[FaceMode](https://facemode.io) avatar output for LiveKit Agents JavaScript applications.
 
 ## Install
 

@@ -1,6 +1,6 @@
 # pipecat-facemode
 
-FaceMode avatar output for Pipecat pipelines. The integration taps
+[FaceMode](https://facemode.io) avatar output for Pipecat pipelines. The integration taps
 `TTSAudioRawFrame`, sends canonical 16-bit PCM to FaceMode, and converts the
 avatar's LiveKit audio and video tracks back into Pipecat output frames.
 

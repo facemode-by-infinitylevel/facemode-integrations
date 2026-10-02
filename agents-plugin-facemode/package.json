@@ -30,14 +30,14 @@
     "prepare": "npm run build"
   },
   "dependencies": {
-    "@livekit/agents": "1.6.2",
-    "@livekit/rtc-node": "0.13.33",
-    "ws": "8.21.3"
+    "@livekit/agents": "1.9.1",
+    "@livekit/rtc-node": "1.1.0",
+    "ws": "8.22.0"
   },
   "devDependencies": {
-    "@types/node": "22.15.30",
+    "@types/node": "26.6.3",
     "@types/ws": "8.18.1",
-    "typescript": "5.8.3"
+    "typescript": "7.0.2"
   },
   "publishConfig": {"access": "public"}
 }
