@@ -1,6 +1,6 @@
 {
   "name": "@facemode/agents-plugin-facemode",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "FaceMode avatar integration for LiveKit Agents",
   "license": "Apache-2.0",
   "repository": {
@@ -9,18 +9,29 @@
     "directory": "agents-plugin-facemode"
   },
   "homepage": "https://facemode.io",
-  "keywords": ["livekit", "agents", "avatar", "facemode", "ai", "video", "realtime"],
+  "keywords": [
+    "livekit",
+    "agents",
+    "avatar",
+    "facemode",
+    "ai",
+    "video",
+    "realtime"
+  ],
   "author": "FaceMode",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts", 
+      "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist", "LICENSE"],
+  "files": [
+    "dist",
+    "LICENSE"
+  ],
   "engines": {
     "node": ">=20"
   },
@@ -30,14 +41,21 @@
     "prepare": "npm run build"
   },
   "dependencies": {
-    "@livekit/agents": "1.9.1",
+    "@livekit/agents": "1.9.2",
     "@livekit/rtc-node": "1.1.0",
     "ws": "8.22.0"
   },
+  "overrides": {
+    "@livekit/agents": {
+      "sharp": "0.35.5"
+    }
+  },
   "devDependencies": {
-    "@types/node": "26.6.3",
-    "@types/ws": "8.18.1",
+    "@types/node": "26.6.5",
+    "@types/ws": "8.18.2",
     "typescript": "7.0.2"
   },
-  "publishConfig": {"access": "public"}
+  "publishConfig": {
+    "access": "public"
+  }
 }

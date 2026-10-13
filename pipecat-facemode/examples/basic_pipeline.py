@@ -102,6 +102,9 @@ async def main() -> None:
     worker = PipelineWorker(
         pipeline,
         params=PipelineParams(audio_out_sample_rate=24_000),
+        # FaceMode session creation waits on the remote avatar worker, whose
+        # cold start can exceed the default 20s start watchdog.
+        start_timeout_secs=300,
     )
 
     @transport.event_handler("on_first_participant_joined")

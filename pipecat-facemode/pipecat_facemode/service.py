@@ -66,6 +66,13 @@ _INGESTION_MAX_RETRY_SECONDS = 2.0
 _END_ACK_TIMEOUT_SECONDS = 3.0
 _WS_OPEN_TIMEOUT_SECONDS = 240.0
 _WS_CLOSE_TIMEOUT = 2.0
+# Teardown must always complete: every shutdown wait is bounded so a wedged
+# LiveKit stream, send lock, or room disconnect cannot stall the EndFrame path.
+_SHUTDOWN_LOCK_TIMEOUT_SECONDS = 10.0
+_END_SIGNAL_TIMEOUT_SECONDS = 5.0
+_TASK_JOIN_TIMEOUT_SECONDS = 3.0
+_STREAM_CLOSE_TIMEOUT_SECONDS = 2.0
+_ROOM_DISCONNECT_TIMEOUT_SECONDS = 3.0
 _RECONNECT_MAX_ATTEMPTS = 2
 _RECONNECT_INITIAL_BACKOFF_SECONDS = 0.5
 _RECONNECT_MAX_BACKOFF_SECONDS = 2.0
@@ -273,7 +280,9 @@ class FaceModeVideoService(FrameProcessor):
             return
 
         if isinstance(frame, EndFrame):
+            logger.info("FaceMode teardown starting on EndFrame")
             await self._shutdown(send_end_session=True)
+            logger.info("FaceMode teardown complete; forwarding EndFrame")
             await self.push_frame(frame, direction)
             return
 
@@ -1214,8 +1223,29 @@ class FaceModeVideoService(FrameProcessor):
             task.cancel()
 
     async def _shutdown(self, *, send_end_session: bool) -> None:
-        async with self._lifecycle_lock:
+        # Trip the bail flags before taking the lock so a startup or reconnect
+        # sequence holding it exits at its next check, and bound the acquire
+        # itself for the same reason.
+        self._stopping = True
+        self._transport_terminal = True
+        self._transport_ready_event.set()
+        try:
+            await asyncio.wait_for(
+                self._lifecycle_lock.acquire(),
+                timeout=_SHUTDOWN_LOCK_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "FaceMode shutdown: lifecycle lock held over %.1fs; "
+                "tearing down without it",
+                _SHUTDOWN_LOCK_TIMEOUT_SECONDS,
+            )
             await self._shutdown_locked(send_end_session=send_end_session)
+            return
+        try:
+            await self._shutdown_locked(send_end_session=send_end_session)
+        finally:
+            self._lifecycle_lock.release()
 
     async def _shutdown_locked(self, *, send_end_session: bool) -> None:
         """Tear down session resources; caller must hold ``_lifecycle_lock``."""
@@ -1226,12 +1256,15 @@ class FaceModeVideoService(FrameProcessor):
         self._transport_ready_event.set()
         self._accept_tracks = False
         self._cancel_utterance_timer()
+        logger.info("FaceMode shutdown: signaling end session")
 
         websocket = self.websocket
         if send_end_session and websocket is not None and self._protocol_started:
             # wait_for raises builtin TimeoutError when the server never sends
-            # "ended"; it must not escape or the teardown below is skipped.
-            with contextlib.suppress(FaceModeError, asyncio.TimeoutError):
+            # "ended"; it must not escape or the teardown below is skipped. The
+            # outer bound also covers a wedged send or a send-lock holder that
+            # never releases.
+            async def _signal_end() -> None:
                 if self._utterance_active:
                     await self._send_control("end_utterance")
                 await self._send_control("end_session")
@@ -1239,8 +1272,16 @@ class FaceModeVideoService(FrameProcessor):
                     self._session_ended_event.wait(),
                     timeout=_END_ACK_TIMEOUT_SECONDS,
                 )
+
+            with contextlib.suppress(
+                FaceModeError, asyncio.TimeoutError, asyncio.CancelledError
+            ):
+                await asyncio.wait_for(
+                    _signal_end(), timeout=_END_SIGNAL_TIMEOUT_SECONDS
+                )
         self._utterance_active = False
         self._utterance_context_id = None
+        logger.info("FaceMode shutdown: cancelling background tasks")
 
         current = asyncio.current_task()
         tasks = [
@@ -1252,26 +1293,65 @@ class FaceModeVideoService(FrameProcessor):
         self._receiver_task = None
         self._track_tasks.clear()
         self._track_kinds.clear()
-        for task in tasks:
-            if task is not None and task is not current and not task.done():
+        pending = [
+            task for task in tasks if task is not None and task is not current
+        ]
+        for task in pending:
+            if not task.done():
                 task.cancel()
-        for task in tasks:
-            if task is not None and task is not current:
+        abandoned: set[asyncio.Task[Any]] = set()
+        if pending:
+            # A task blocked in a LiveKit FFI read or a wedged stream close can
+            # ignore cancellation; bound the join so it cannot hold EndFrame.
+            try:
+                done, abandoned = await asyncio.wait(
+                    pending, timeout=_TASK_JOIN_TIMEOUT_SECONDS
+                )
+            except asyncio.CancelledError:
+                done, abandoned = set(), set(pending)
+            for finished in done:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
+                    finished.exception()
+            if abandoned:
+                logger.warning(
+                    "FaceMode shutdown abandoned %s unfinished task(s) after %.1fs",
+                    len(abandoned),
+                    _TASK_JOIN_TIMEOUT_SECONDS,
+                )
 
+        logger.info("FaceMode shutdown: closing track streams")
         for stream in list(self._track_streams.values()):
             await _close_async_resource(stream)
         self._track_streams.clear()
 
         self.websocket = None
         if websocket is not None:
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await asyncio.wait_for(websocket.close(), timeout=_WS_CLOSE_TIMEOUT)
 
         room = self.room
         self.room = None
+        logger.info("FaceMode shutdown: disconnecting room")
         await _disconnect_room(room)
+
+        if abandoned:
+            # Room disconnect and stream closes usually unblock tasks that were
+            # stuck in LiveKit reads; give them one last short window so the
+            # event loop can shut down without stragglers.
+            try:
+                drained, still_pending = await asyncio.wait(
+                    list(abandoned), timeout=_TASK_JOIN_TIMEOUT_SECONDS
+                )
+            except asyncio.CancelledError:
+                drained, still_pending = set(), abandoned
+            for finished in drained:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    finished.exception()
+            if still_pending:
+                logger.warning(
+                    "FaceMode shutdown leaving %s task(s) pending after teardown",
+                    len(still_pending),
+                )
 
         self.session = None
         self._session_log_marker = None
@@ -1381,8 +1461,12 @@ async def _disconnect_room(room: Any) -> None:
     except Exception:
         return
     if hasattr(result, "__await__"):
-        with contextlib.suppress(Exception):
-            await result
+        # Bound the wait: rtc.Room.disconnect() is an FFI call that can stall
+        # teardown if it never resolves.
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(
+                result, timeout=_ROOM_DISCONNECT_TIMEOUT_SECONDS
+            )
 
 
 async def _close_async_resource(resource: Any) -> None:
@@ -1398,8 +1482,10 @@ async def _close_async_resource(resource: Any) -> None:
     except Exception:
         return
     if hasattr(result, "__await__"):
-        with contextlib.suppress(Exception):
-            await result
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(
+                result, timeout=_STREAM_CLOSE_TIMEOUT_SECONDS
+            )
 
 
 def _frame_types(*candidates: Any) -> tuple[type, ...]:
